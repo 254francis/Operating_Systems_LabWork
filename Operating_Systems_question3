@@ -1,0 +1,519 @@
+/**
+ * Dining Philosophers Problem 
+ * 
+ * This program demonstrates the classic Dining Philosophers synchronization problem
+ * and implements multiple solutions to prevent deadlock and starvation.
+ * 
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <unistd.h>
+#include <time.h>
+#include <string.h>
+
+// Global Constants
+#define NUM_PHILOSOPHERS 5
+#define MAX_EATING_CYCLES 3
+#define THINKING_TIME_MAX 3
+#define EATING_TIME_MAX 2
+
+// Philosopher States
+typedef enum {
+    THINKING,
+    HUNGRY,
+    EATING
+} philosopher_state_t;
+
+// Global Variables
+sem_t chopsticks[NUM_PHILOSOPHERS];     // Semaphores for chopsticks
+sem_t waiter;                           // Waiter semaphore (limits concurrent diners)
+pthread_mutex_t state_mutex;            // Mutex for state changes
+pthread_mutex_t output_mutex;           // Mutex for synchronized output
+philosopher_state_t state[NUM_PHILOSOPHERS]; // Philosopher states
+int eating_count[NUM_PHILOSOPHERS];     // Track eating cycles per philosopher
+int total_meals = 0;                    // Total meals consumed
+int solution_type = 1;                  // Solution method selection
+
+// Function Prototypes
+void* philosopher_asymmetric(void* arg);
+void* philosopher_hierarchy(void* arg);
+void* philosopher_waiter(void* arg);
+void initialize_semaphores();
+void cleanup_semaphores();
+void print_status(int philosopher_id, const char* action);
+void print_table_state();
+int get_left_chopstick(int philosopher_id);
+int get_right_chopstick(int philosopher_id);
+void simulate_thinking(int philosopher_id);
+void simulate_eating(int philosopher_id);
+
+/**
+ * Initialize all synchronization primitives
+ */
+void initialize_semaphores() {
+    // Initialize chopstick semaphores (binary semaphores)
+    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
+        if (sem_init(&chopsticks[i], 0, 1) != 0) {
+            perror("Failed to initialize chopstick semaphore");
+            exit(1);
+        }
+        state[i] = THINKING;
+        eating_count[i] = 0;
+    }
+    
+    // Initialize waiter semaphore (allows max 4 philosophers to compete)
+    if (sem_init(&waiter, 0, NUM_PHILOSOPHERS - 1) != 0) {
+        perror("Failed to initialize waiter semaphore");
+        exit(1);
+    }
+    
+    // Initialize mutexes
+    if (pthread_mutex_init(&state_mutex, NULL) != 0 || 
+        pthread_mutex_init(&output_mutex, NULL) != 0) {
+        perror("Failed to initialize mutexes");
+        exit(1);
+    }
+    
+    printf("All synchronization primitives initialized successfully\n\n");
+}
+
+/**
+ * Cleanup all synchronization primitives
+ */
+void cleanup_semaphores() {
+    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
+        sem_destroy(&chopsticks[i]);
+    }
+    sem_destroy(&waiter);
+    pthread_mutex_destroy(&state_mutex);
+    pthread_mutex_destroy(&output_mutex);
+}
+
+/**
+ * Get left chopstick index for given philosopher
+ */
+int get_left_chopstick(int philosopher_id) {
+    return philosopher_id;
+}
+
+/**
+ * Get right chopstick index for given philosopher
+ */
+int get_right_chopstick(int philosopher_id) {
+    return (philosopher_id + 1) % NUM_PHILOSOPHERS;
+}
+
+/**
+ * Thread-safe status printing with table visualization
+ */
+void print_status(int philosopher_id, const char* action) {
+    pthread_mutex_lock(&output_mutex);
+    
+    printf("Philosopher %d: %s\n", philosopher_id, action);
+    print_table_state();
+    printf("\n");
+    
+    pthread_mutex_unlock(&output_mutex);
+}
+
+/**
+ * Print current state of all philosophers and chopsticks
+ */
+void print_table_state() {
+    printf("   Table State: ");
+    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
+        char state_char;
+        switch (state[i]) {
+            case THINKING: state_char = 'T'; break;
+            case HUNGRY:   state_char = 'H'; break;
+            case EATING:   state_char = 'E'; break;
+        }
+        
+        // Check chopstick availability
+        int left_available, right_available;
+        sem_getvalue(&chopsticks[get_left_chopstick(i)], &left_available);
+        sem_getvalue(&chopsticks[get_right_chopstick(i)], &right_available);
+        
+        printf("P%d(%c)", i, state_char);
+        if (i < NUM_PHILOSOPHERS - 1) {
+            printf("-%s-", left_available ? "" : "");
+        }
+    }
+    printf(" | Meals: %d", total_meals);
+}
+
+/**
+ * Simulate thinking process with random duration
+ */
+void simulate_thinking(int philosopher_id) {
+    pthread_mutex_lock(&state_mutex);
+    state[philosopher_id] = THINKING;
+    pthread_mutex_unlock(&state_mutex);
+    
+    int think_time = (rand() % THINKING_TIME_MAX) + 1;
+    print_status(philosopher_id, "Started thinking ");
+    sleep(think_time);
+}
+
+/**
+ * Simulate eating process with random duration
+ */
+void simulate_eating(int philosopher_id) {
+    pthread_mutex_lock(&state_mutex);
+    state[philosopher_id] = EATING;
+    eating_count[philosopher_id]++;
+    total_meals++;
+    pthread_mutex_unlock(&state_mutex);
+    
+    int eat_time = (rand() % EATING_TIME_MAX) + 1;
+    print_status(philosopher_id, "Started eating ");
+    sleep(eat_time);
+    print_status(philosopher_id, "Finished eating ");
+}
+
+/**
+ * SOLUTION 1: Asymmetric Approach (Odd/Even Chopstick Ordering)
+ * 
+ * Prevention Strategy:
+ * - Even-numbered philosophers pick up left chopstick first
+ * - Odd-numbered philosophers pick up right chopstick first
+ * - Breaks circular wait condition by imposing asymmetric ordering
+ */
+void* philosopher_asymmetric(void* arg) {
+    int philosopher_id = *(int*)arg;
+    int left_chopstick = get_left_chopstick(philosopher_id);
+    int right_chopstick = get_right_chopstick(philosopher_id);
+    
+    printf("Philosopher %d started (Asymmetric Solution)\n", philosopher_id);
+    
+    for (int cycle = 0; cycle < MAX_EATING_CYCLES; cycle++) {
+        // Think
+        simulate_thinking(philosopher_id);
+        
+        // Get hungry
+        pthread_mutex_lock(&state_mutex);
+        state[philosopher_id] = HUNGRY;
+        pthread_mutex_unlock(&state_mutex);
+        print_status(philosopher_id, "Became hungry ");
+        
+        // Asymmetric chopstick acquisition
+        if (philosopher_id % 2 == 0) {
+            // Even philosopher: left first, then right
+            print_status(philosopher_id, "Trying to pick up left chopstick...");
+            sem_wait(&chopsticks[left_chopstick]);
+            print_status(philosopher_id, "Picked up left chopstick ");
+            
+            print_status(philosopher_id, "Trying to pick up right chopstick...");
+            sem_wait(&chopsticks[right_chopstick]);
+            print_status(philosopher_id, "Picked up right chopstick ");
+        } else {
+            // Odd philosopher: right first, then left
+            print_status(philosopher_id, "Trying to pick up right chopstick...");
+            sem_wait(&chopsticks[right_chopstick]);
+            print_status(philosopher_id, "Picked up right chopstick ");
+            
+            print_status(philosopher_id, "Trying to pick up left chopstick...");
+            sem_wait(&chopsticks[left_chopstick]);
+            print_status(philosopher_id, "Picked up left chopstick ");
+        }
+        
+        // Eat
+        simulate_eating(philosopher_id);
+        
+        // Put down chopsticks
+        sem_post(&chopsticks[left_chopstick]);
+        sem_post(&chopsticks[right_chopstick]);
+        print_status(philosopher_id, "Put down both chopsticks");
+    }
+    
+    printf("Philosopher %d finished all meals (Total: %d)\n", 
+           philosopher_id, eating_count[philosopher_id]);
+    return NULL;
+}
+
+/**
+ * SOLUTION 2: Resource Hierarchy Approach
+ * 
+ * Prevention Strategy:
+ * - Assign unique numbers to chopsticks (0-4)
+ * - Always acquire chopsticks in ascending numerical order
+ * - Prevents circular wait by imposing total ordering on resources
+ */
+void* philosopher_hierarchy(void* arg) {
+    int philosopher_id = *(int*)arg;
+    int left_chopstick = get_left_chopstick(philosopher_id);
+    int right_chopstick = get_right_chopstick(philosopher_id);
+    
+    // Determine ordering based on chopstick numbers
+    int first_chopstick = (left_chopstick < right_chopstick) ? left_chopstick : right_chopstick;
+    int second_chopstick = (left_chopstick < right_chopstick) ? right_chopstick : left_chopstick;
+    
+    printf("🚀 Philosopher %d started (Hierarchy Solution - Order: %d, %d)\n", 
+           philosopher_id, first_chopstick, second_chopstick);
+    
+    for (int cycle = 0; cycle < MAX_EATING_CYCLES; cycle++) {
+        // Think
+        simulate_thinking(philosopher_id);
+        
+        // Get hungry
+        pthread_mutex_lock(&state_mutex);
+        state[philosopher_id] = HUNGRY;
+        pthread_mutex_unlock(&state_mutex);
+        print_status(philosopher_id, "Became hungry ");
+        
+        // Acquire chopsticks in hierarchical order
+        printf("Philosopher %d: Acquiring chopstick %d first (hierarchy rule)\n", 
+               philosopher_id, first_chopstick);
+        sem_wait(&chopsticks[first_chopstick]);
+        print_status(philosopher_id, "Acquired first chopstick ");
+        
+        printf("Philosopher %d: Acquiring chopstick %d second\n", 
+               philosopher_id, second_chopstick);
+        sem_wait(&chopsticks[second_chopstick]);
+        print_status(philosopher_id, "Acquired second chopstick");
+        
+        // Eat
+        simulate_eating(philosopher_id);
+        
+        // Release chopsticks in reverse order
+        sem_post(&chopsticks[second_chopstick]);
+        sem_post(&chopsticks[first_chopstick]);
+        print_status(philosopher_id, "Released both chopsticks");
+    }
+    
+    printf("Philosopher %d finished all meals (Total: %d)\n", 
+           philosopher_id, eating_count[philosopher_id]);
+    return NULL;
+}
+
+/**
+ * SOLUTION 3: Waiter/Monitor Approach
+ * 
+ * Prevention Strategy:
+ * - Limit number of philosophers that can compete simultaneously
+ * - Use waiter semaphore to allow at most (N-1) philosophers to try eating
+ * - Guarantees at least one philosopher can complete the eating process
+ */
+void* philosopher_waiter(void* arg) {
+    int philosopher_id = *(int*)arg;
+    int left_chopstick = get_left_chopstick(philosopher_id);
+    int right_chopstick = get_right_chopstick(philosopher_id);
+    
+    printf("Philosopher %d started (Waiter Solution)\n", philosopher_id);
+    
+    for (int cycle = 0; cycle < MAX_EATING_CYCLES; cycle++) {
+        // Think
+        simulate_thinking(philosopher_id);
+        
+        // Get hungry and request permission from waiter
+        pthread_mutex_lock(&state_mutex);
+        state[philosopher_id] = HUNGRY;
+        pthread_mutex_unlock(&state_mutex);
+        print_status(philosopher_id, "Became hungry, asking waiter for permission 🙋");
+        
+        // Request permission from waiter (limits concurrency)
+        sem_wait(&waiter);
+        print_status(philosopher_id, "Waiter granted permission");
+        
+        // Acquire chopsticks (traditional left-right order is safe with waiter)
+        print_status(philosopher_id, "Trying to pick up left chopstick...");
+        sem_wait(&chopsticks[left_chopstick]);
+        print_status(philosopher_id, "Picked up left chopstick");
+        
+        print_status(philosopher_id, "Trying to pick up right chopstick...");
+        sem_wait(&chopsticks[right_chopstick]);
+        print_status(philosopher_id, "Picked up right chopstick");
+        
+        // Eat
+        simulate_eating(philosopher_id);
+        
+        // Put down chopsticks and notify waiter
+        sem_post(&chopsticks[left_chopstick]);
+        sem_post(&chopsticks[right_chopstick]);
+        print_status(philosopher_id, "Put down both chopsticks");
+        
+        sem_post(&waiter);
+        print_status(philosopher_id, "Notified waiter - seat available");
+    }
+    
+    printf("Philosopher %d finished all meals (Total: %d)\n", 
+           philosopher_id, eating_count[philosopher_id]);
+    return NULL;
+}
+
+/**
+ * Display  simulation results and analysis
+ */
+void print_simulation_results(time_t start_time, time_t end_time) {
+    printf("\n" "="*70 "\n");
+    printf("                    SIMULATION RESULTS\n");
+    printf("="*70 "\n");
+    
+    printf("Execution Time: %.2f seconds\n", difftime(end_time, start_time));
+    printf("Total Meals Consumed: %d\n", total_meals);
+    printf("Expected Meals: %d\n", NUM_PHILOSOPHERS * MAX_EATING_CYCLES);
+    
+    printf("\nPer-Philosopher Statistics:\n");
+    printf("%-12s %-15s %-15s\n", "Philosopher", "Meals Eaten", "Efficiency");
+    printf("-"*42 "\n");
+    
+    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
+        double efficiency = (double)eating_count[i] / MAX_EATING_CYCLES * 100;
+        printf("%-12d %-15d %-14.1f%%\n", i, eating_count[i], efficiency);
+    }
+    
+    // Analysis
+    printf("\n DEADLOCK ANALYSIS:\n");
+    if (total_meals == NUM_PHILOSOPHERS * MAX_EATING_CYCLES) {
+        printf("SUCCESS: No deadlock occurred - all philosophers completed their meals\n");
+        printf("STARVATION: No starvation detected - all philosophers ate equally\n");
+    } else {
+        printf("ONYO/WARNING: Potential deadlock or starvation detected\n");
+    }
+    
+    printf("\n SYNCHRONIZATION EFFICIENCY: %.1f%%\n", 
+           (double)total_meals / (NUM_PHILOSOPHERS * MAX_EATING_CYCLES) * 100);
+    
+    printf("="*70 "\n");
+}
+
+/**
+ * Display solution comparison and educational information
+ */
+void print_solution_analysis() {
+    printf("\n" "="*80 "\n");
+    printf("                    DINING PHILOSOPHERS SOLUTIONS ANALYSIS\n");
+    printf("="*80 "\n");
+    
+    printf("PROBLEM: Classical deadlock scenario where circular wait can occur\n\n");
+    
+    printf("SOLUTION STRATEGIES IMPLEMENTED:\n\n");
+    
+    printf("1. ASYMMETRIC APPROACH:\n");
+    printf("   • Strategy: Different chopstick acquisition order for odd/even philosophers\n");
+    printf("   • Prevention: Breaks symmetry to prevent circular wait\n");
+    printf("   • Pros: Simple, efficient, no central coordinator needed\n");
+    printf("   • Cons: Requires careful ordering, not easily generalizable\n\n");
+    
+    printf("2. RESOURCE HIERARCHY:\n");
+    printf("   • Strategy: Total ordering on resources (chopsticks numbered 0-4)\n");
+    printf("   • Prevention: Always acquire resources in ascending order\n");
+    printf("   • Pros: Generalizable, provably deadlock-free\n");
+    printf("   • Cons: May reduce concurrency, requires global resource ordering\n\n");
+    
+    printf("3. WAITER/MONITOR APPROACH:\n");
+    printf("   • Strategy: Limit concurrent philosophers to N-1\n");
+    printf("   • Prevention: Ensures at least one philosopher can always complete\n");
+    printf("   • Pros: Intuitive, easy to implement, guarantees progress\n");
+    printf("   • Cons: Reduces parallelism, central bottleneck\n\n");
+    
+    printf("DEADLOCK CONDITIONS BROKEN:\n");
+    printf("• Circular Wait: Eliminated by asymmetric/hierarchical ordering or limiting access\n");
+    printf("• Hold and Wait: Philosophers acquire both chopsticks atomically\n");
+    printf("• No Preemption: Maintained (philosophers voluntarily release chopsticks)\n");
+    printf("• Mutual Exclusion: Maintained (chopsticks are exclusive resources)\n");
+    
+    printf("="*80 "\n");
+}
+
+/**
+ * Main function - orchestrates the simulation
+ */
+int main() {
+    pthread_t philosophers[NUM_PHILOSOPHERS];
+    int philosopher_ids[NUM_PHILOSOPHERS];
+    time_t start_time, end_time;
+    
+    // Seed random number generator
+    srand(time(NULL));
+    
+    printf("╔════════════════════════════════════════════════════════════════════╗\n");
+    printf("║                    DINING PHILOSOPHERS PROBLEM                    ║\n");
+    printf("║                    Deadlock Prevention Solutions                   ║\n");
+    printf("╚════════════════════════════════════════════════════════════════════╝\n\n");
+    
+    printf("Select solution method:\n");
+    printf("1. Asymmetric Approach (Odd/Even ordering)\n");
+    printf("2. Resource Hierarchy Approach\n");
+    printf("3. Waiter/Monitor Approach\n");
+    printf("Enter choice (1-3): ");
+    
+    if (scanf("%d", &solution_type) != 1 || solution_type < 1 || solution_type > 3) {
+        printf("Invalid input. Using default: Asymmetric Approach\n");
+        solution_type = 1;
+    }
+    
+    // Initialize synchronization primitives
+    initialize_semaphores();
+    
+    // Initialize philosopher IDs
+    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
+        philosopher_ids[i] = i;
+    }
+    
+    printf(" Start Dining Philosophers Simulation...\n");
+    printf("   Method: %s\n", 
+           (solution_type == 1) ? "Asymmetric Approach" :
+           (solution_type == 2) ? "Resource Hierarchy" : "Waiter/Monitor");
+    printf("   Philosophers: %d\n", NUM_PHILOSOPHERS);
+    printf("   Max eating cycles per philosopher: %d\n", MAX_EATING_CYCLES);
+    printf("   Expected total meals: %d\n\n", NUM_PHILOSOPHERS * MAX_EATING_CYCLES);
+    
+    start_time = time(NULL);
+    
+    // Create philosopher threads based on selected solution
+    void* (*philosopher_func)(void*);
+    switch (solution_type) {
+        case 1: philosopher_func = philosopher_asymmetric; break;
+        case 2: philosopher_func = philosopher_hierarchy; break;
+        case 3: philosopher_func = philosopher_waiter; break;
+        default: philosopher_func = philosopher_asymmetric;
+    }
+    
+    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
+        if (pthread_create(&philosophers[i], NULL, philosopher_func, &philosopher_ids[i]) != 0) {
+            perror("Failed to create philosopher thread");
+            exit(1);
+        }
+    }
+    
+    // Wait for all philosophers to finish
+    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
+        pthread_join(philosophers[i], NULL);
+    }
+    
+    end_time = time(NULL);
+    
+    // Display results
+    print_simulation_results(start_time, end_time);
+    print_solution_analysis();
+    
+    // Cleanup
+    cleanup_semaphores();
+    
+    printf("\n Simulation completed successfully!\n");
+    printf("Key takeaway: Proper synchronization prevents deadlock while maintaining fairness\n");
+    
+    return 0;
+}
+
+/**
+ * SIDE NOTES:
+ * 
+ * This implementation demonstrates three different approaches to solving the
+ * Dining Philosophers problem, each targeting different aspects of deadlock prevention:
+ * 
+ * 1. Breaking circular wait through asymmetric resource ordering
+ * 2. Preventing circular wait through hierarchical resource numbering  
+ * 3. Limiting concurrency to guarantee progress
+ * 
+ * Each solution maintains the four essential properties while breaking at least
+ * one of the four necessary conditions for deadlock to occur.
+ * 
+ * The program includes comprehensive logging, performance analysis, and
+ * educational explanations to demonstrate both theoretical concepts and
+ * practical implementation techniques.
+ */
